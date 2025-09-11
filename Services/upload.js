@@ -6,16 +6,14 @@ import dotenv from 'dotenv';
 dotenv.config();
 
 export default class Upload {
+    // --- MÉTODOS DE AUTENTICACIÓN Y AUXILIARES (Sin cambios) ---
     static getOAuth2Client() {
         const { GOOGLE_CLIENT_ID, GOOGLE_CLIENT_SECRET, GOOGLE_REDIRECT_URI } = process.env;
-
         const oAuth2Client = new google.auth.OAuth2(
             GOOGLE_CLIENT_ID,
             GOOGLE_CLIENT_SECRET,
             GOOGLE_REDIRECT_URI
         );
-
-        console.log('[Google OAuth]: Cliente OAuth configurado.');
         return oAuth2Client;
     }
 
@@ -25,7 +23,6 @@ export default class Upload {
             access_type: 'offline',
             scope: ['https://www.googleapis.com/auth/drive'],
         });
-        console.log('[Google OAuth]: URL de autorización generada:', authUrl);
         return authUrl;
     }
 
@@ -34,7 +31,6 @@ export default class Upload {
         try {
             const { tokens } = await oAuth2Client.getToken(code);
             oAuth2Client.setCredentials(tokens);
-            console.log('[Google OAuth]: Token generado con éxito:', tokens);
             return tokens;
         } catch (error) {
             console.error('[Google OAuth Error]: Error al generar el token:', error);
@@ -44,171 +40,171 @@ export default class Upload {
 
     static async getDriveService(oAuth2Client) {
         const drive = google.drive({ version: 'v3', auth: oAuth2Client });
-        console.log('[Google Drive]: Servicio de Google Drive configurado.');
         return drive;
+    }
+
+    static _getStageName(etapPro) {
+        switch (etapPro) {
+            case 1: return 'IMPLEMENTACION';
+            case 2: return 'SOPORTE';
+            case 3: return 'TD';
+            default: return 'INDEFINIDO';
+        }
+    }
+
+    static _getModelName(modEmpNom) {
+        const modelNameUpper = modEmpNom.toUpperCase();
+        if (modelNameUpper === 'MANTISFICCGX2') return 'MANTISFICCGX2';
+        if (modelNameUpper === 'MANTISFICC') return 'MANTISFICC';
+        return 'MANTIS WEB';
+    }
+
+    static async _findOrCreateFolder(drive, folderName, parentId) {
+        const folderQuery = await drive.files.list({
+            q: `name = '${folderName}' and mimeType = 'application/vnd.google-apps.folder' and '${parentId}' in parents and trashed = false`,
+            fields: 'files(id)',
+            pageSize: 1,
+        });
+
+        if (folderQuery.data.files.length > 0) {
+            console.log(`[Google Drive]: Carpeta encontrada: ${folderName}`);
+            return folderQuery.data.files[0].id;
+        } else {
+            console.log(`[Google Drive]: Creando carpeta: ${folderName}`);
+            const newFolder = await drive.files.create({
+                resource: {
+                    name: folderName,
+                    mimeType: 'application/vnd.google-apps.folder',
+                    parents: [parentId],
+                },
+                fields: 'id',
+            });
+            return newFolder.data.id;
+        }
     }
 
     static async uploadFile(req, res) {
         try {
             console.log('[UploadFile]: Inicio del proceso de subida.');
-
-            // Asegurarse de que el contexto de `this` sea correcto
             const oAuth2Client = Upload.getOAuth2Client();
-
-            // Verificar si GOOGLE_OAUTH_TOKEN está definido
-            const tokenEnv = process.env.GOOGLE_OAUTH_TOKEN;
-            if (!tokenEnv) {
-                const authUrl = Upload.generateAuthUrl();
-                console.log('[Google OAuth]: Por favor, autoriza la aplicación visitando esta URL:', authUrl);
-                return res.status(400).json({
-                    error: 'Falta el token de OAuth. Autoriza la aplicación visitando la URL proporcionada.',
-                    authUrl,
-                });
+            const refreshToken = process.env.GOOGLE_REFRESH_TOKEN;
+            if (!refreshToken) {
+                console.error('[Google OAuth]: Falta el GOOGLE_REFRESH_TOKEN en el archivo .env.');
+                return res.status(500).json({ error: 'Error de configuración: Falta el token de refresco.' });
             }
-
-            // Usar el token directamente como string
-            const token = { access_token: tokenEnv };
-            oAuth2Client.setCredentials(token);
-            console.log('[Google OAuth]: Token configurado correctamente.');
-
+            oAuth2Client.setCredentials({ refresh_token: refreshToken });
             const drive = await Upload.getDriveService(oAuth2Client);
-
-            // ID de la carpeta en la unidad personal
-            const parentFolderId = process.env.GOOGLE_FOLDER_ID;
-
-            // Conexión a la base de datos
-            console.log('[Database]: Conectando a la base de datos.');
+            const rootFolderId = process.env.GOOGLE_FOLDER_ID;
             const poolConnect = await pool.connect();
+            
+            const results = {
+                autorizaciones: [],
+                adjuntos: []
+            };
+
             try {
-                const queryResult = await poolConnect.request()
-                    .query(`SELECT T.TickSec, T.TickComFac, T.CrmEmpCod, E.CrmEmpNom
-                           FROM Ticket T
-                           JOIN CrmEmpresa E ON T.CrmEmpCod = E.CrmEmpCod
-                           WHERE T.TickComFac IS NOT NULL`);
+                // --- PROCESO 1: SUBIR AUTORIZACIONES (TickComFac) ---
+                console.log('\n[Proceso 1]: Iniciando subida de Autorizaciones...');
+                const authQueryResult = await poolConnect.request()
+                    .query(`SELECT T.TickSec, T.TickComFac, E.CrmEmpNom, E.CrmEtapPro, ME.ModEmpNom
+                            FROM Ticket T
+                            JOIN CrmEmpresa E ON T.CrmEmpCod = E.CrmEmpCod
+                          	JOIN ModelosEmpresa ME ON E.ModEmpSec = ME.ModEmpSec
+                          	WHERE T.TickComFac IS NOT NULL`);
+                console.log(`[Proceso 1]: Autorizaciones encontradas: ${authQueryResult.recordset.length}`);
 
-                console.log(`[Database]: Registros obtenidos: ${queryResult.recordset.length}`);
-                const tickets = queryResult.recordset;
+                for (const ticket of authQueryResult.recordset) {
+                    // ... (La lógica para crear carpetas y subir el archivo es idéntica a la versión anterior)
+                    const { TickSec, TickComFac, CrmEmpNom, CrmEtapPro, ModEmpNom } = ticket;
+                    const stageName = Upload._getStageName(CrmEtapPro);
+                    const modelName = Upload._getModelName(ModEmpNom);
+                    const topLevelFolderName = `EMPRESAS (${stageName}) ${modelName}`;
+                    const topLevelFolderId = await Upload._findOrCreateFolder(drive, topLevelFolderName, rootFolderId);
+                    const companyFolderId = await Upload._findOrCreateFolder(drive, CrmEmpNom, topLevelFolderId);
+                    const authFolderId = await Upload._findOrCreateFolder(drive, 'Autorizaciones', companyFolderId);
+                    
+                    let mimeType, fileExtension;
+                    const fileSignature = TickComFac.toString('hex', 0, 4);
+                    if (fileSignature.startsWith('ffd8')) { mimeType = 'image/jpeg'; fileExtension = 'jpg'; }
+                    else if (fileSignature.startsWith('89504e47')) { mimeType = 'image/png'; fileExtension = 'png'; }
+                    else if (fileSignature.startsWith('25504446')) { mimeType = 'application/pdf'; fileExtension = 'pdf'; }
+                    else { console.error(`[Proceso 1]: Formato no reconocido para TickSec: ${TickSec}`); continue; }
 
-                const urls = [];
-
-                for (const ticket of tickets) {
-                    const { TickSec, TickComFac, CrmEmpNom } = ticket;
-                    console.log(`[Ticket]: Procesando TickSec: ${TickSec}, Empresa: ${CrmEmpNom}`);
-
-                    // Verificar o crear carpeta de la empresa
-                    let companyFolderId;
-                    const companyFolder = await drive.files.list({
-                        q: `name = '${CrmEmpNom}' and mimeType = 'application/vnd.google-apps.folder' and '${parentFolderId}' in parents`,
-                        fields: 'files(id, name)',
-                    });
-
-                    if (companyFolder.data.files.length > 0) {
-                        companyFolderId = companyFolder.data.files[0].id;
-                        console.log(`[Google Drive]: Carpeta de empresa encontrada: ${CrmEmpNom}`);
-                    } else {
-                        const newCompanyFolder = await drive.files.create({
-                            resource: {
-                                name: CrmEmpNom,
-                                mimeType: 'application/vnd.google-apps.folder',
-                                parents: [parentFolderId],
-                            },
-                            fields: 'id',
-                        });
-                        companyFolderId = newCompanyFolder.data.id;
-                        console.log(`[Google Drive]: Carpeta de empresa creada: ${CrmEmpNom}`);
-                    }
-
-                    // Verificar o crear carpeta del ticket
-                    let ticketFolderId;
-                    const ticketFolder = await drive.files.list({
-                        q: `name = '${TickSec}' and mimeType = 'application/vnd.google-apps.folder' and '${companyFolderId}' in parents`,
-                        fields: 'files(id, name)',
-                    });
-
-                    if (ticketFolder.data.files.length > 0) {
-                        ticketFolderId = ticketFolder.data.files[0].id;
-                        console.log(`[Google Drive]: Carpeta de ticket encontrada: ${TickSec}`);
-                    } else {
-                        const newTicketFolder = await drive.files.create({
-                            resource: {
-                                name: TickSec.toString(),
-                                mimeType: 'application/vnd.google-apps.folder',
-                                parents: [companyFolderId],
-                            },
-                            fields: 'id',
-                        });
-                        ticketFolderId = newTicketFolder.data.id;
-                        console.log(`[Google Drive]: Carpeta de ticket creada: ${TickSec}`);
-                    }
-
-                    // Determinar el tipo MIME del archivo basado en el contenido
-                    let mimeType;
-                    const fileSignature = TickComFac.toString('hex', 0, 8);
-
-                    if (fileSignature.startsWith('ffd8')) {
-                        mimeType = 'image/jpeg';
-                    } else if (fileSignature.startsWith('89504e47')) {
-                        mimeType = 'image/png';
-                    } else if (fileSignature.startsWith('25504446')) {
-                        mimeType = 'application/pdf';
-                    } else {
-                        console.error(`[Ticket]: Formato de archivo no reconocido para TickSec: ${TickSec}`);
-                        continue; // Saltar este archivo si el formato no es reconocido
-                    }
-
-                    // Convertir el Buffer en un flujo
                     const fileStream = Readable.from(TickComFac);
+                    const fileMetadata = { name: `autorizacion_${TickSec}.${fileExtension}`, parents: [authFolderId] };
+                    const media = { mimeType: mimeType, body: fileStream };
+                    const response = await drive.files.create({ resource: fileMetadata, media: media, fields: 'id, webViewLink' });
+                    const { id: fileId, webViewLink: fileUrl } = response.data;
 
-                    // Subir archivo a Google Drive con el formato correcto
-                    const fileMetadata = {
-                        name: `ComprobanteDePago_${TickSec}.${mimeType.split('/')[1]}`,
-                        parents: [ticketFolderId],
-                    };
-
-                    const media = {
-                        mimeType: mimeType,
-                        body: fileStream,
-                    };
-
-                    const response = await drive.files.create({
-                        resource: fileMetadata,
-                        media: media,
-                        fields: 'id, webViewLink',
-                    });
-
-                    const fileId = response.data.id;
-                    const fileUrl = response.data.webViewLink;
-                    console.log(`[Google Drive]: Archivo subido con ID: ${fileId}, URL: ${fileUrl}`);
-
-                    // Hacer público el archivo
-                    await drive.permissions.create({
-                        fileId: fileId,
-                        requestBody: {
-                            role: 'reader',
-                            type: 'anyone',
-                        },
-                    });
-                    console.log(`[Google Drive]: Permisos públicos asignados al archivo con ID: ${fileId}`);
-
-                    // Actualizar la base de datos
+                    await drive.permissions.create({ fileId, requestBody: { role: 'reader', type: 'anyone' } });
                     await poolConnect.request()
                         .input('TickSec', sql.Int, TickSec)
                         .input('TickUrlGooDriv', sql.VarChar, fileUrl)
                         .query("UPDATE Ticket SET TickComFac = NULL, TickUrlGooDriv = @TickUrlGooDriv WHERE TickSec = @TickSec");
-                    console.log(`[Database]: TickSec ${TickSec} actualizado en la base de datos.`);
-
-                    urls.push({ ticketSec: TickSec, url: fileUrl });
+                    
+                    results.autorizaciones.push({ ticketSec: TickSec, url: fileUrl });
+                    console.log(`[Proceso 1]: Autorización ${TickSec} subida y actualizada.`);
                 }
 
-                console.log('[UploadFile]: Proceso completado exitosamente.');
-                res.status(200).json({ message: 'Archivos subidos y base de datos actualizada correctamente.', urls });
+                // --- PROCESO 2: SUBIR ADJUNTOS (TickAdjFac) ---
+                console.log('\n[Proceso 2]: Iniciando subida de Adjuntos...');
+                // NOTA: Se asume que la columna de fecha se llama 'TickFec'. Ajústala si es necesario.
+                const adjQueryResult = await poolConnect.request()
+                    .query(`SELECT T.TickSec, T.TickAdjFac, E.CrmEmpNom, E.CrmEtapPro, ME.ModEmpNom
+                          	FROM Ticket T
+                          	JOIN CrmEmpresa E ON T.CrmEmpCod = E.CrmEmpCod
+                          	JOIN ModelosEmpresa ME ON E.ModEmpSec = ME.ModEmpSec
+                          	WHERE T.TickAdjFac IS NOT NULL AND T.TickFecCre >= '2025-09-01'`);
+                console.log(`[Proceso 2]: Adjuntos encontrados: ${adjQueryResult.recordset.length}`);
+
+                for (const ticket of adjQueryResult.recordset) {
+                    const { TickSec, TickAdjFac, CrmEmpNom, CrmEtapPro, ModEmpNom } = ticket;
+                    
+                    // La lógica para encontrar/crear carpetas de primer nivel y empresa es la misma
+                    const stageName = Upload._getStageName(CrmEtapPro);
+                    const modelName = Upload._getModelName(ModEmpNom);
+                    const topLevelFolderName = `EMPRESAS (${stageName}) ${modelName}`;
+                    const topLevelFolderId = await Upload._findOrCreateFolder(drive, topLevelFolderName, rootFolderId);
+                    const companyFolderId = await Upload._findOrCreateFolder(drive, CrmEmpNom, topLevelFolderId);
+                    
+                    // Se crea o busca la carpeta "Adjuntos"
+                    const attachmentsFolderId = await Upload._findOrCreateFolder(drive, 'Adjuntos', companyFolderId);
+                    
+                    let mimeType, fileExtension;
+                    const fileSignature = TickAdjFac.toString('hex', 0, 4);
+                    if (fileSignature.startsWith('ffd8')) { mimeType = 'image/jpeg'; fileExtension = 'jpg'; }
+                    else if (fileSignature.startsWith('89504e47')) { mimeType = 'image/png'; fileExtension = 'png'; }
+                    else if (fileSignature.startsWith('25504446')) { mimeType = 'application/pdf'; fileExtension = 'pdf'; }
+                    else { console.error(`[Proceso 2]: Formato no reconocido para Adjunto de TickSec: ${TickSec}`); continue; }
+
+                    const fileStream = Readable.from(TickAdjFac);
+                    const fileMetadata = { name: `Adjunto_${TickSec}.${fileExtension}`, parents: [attachmentsFolderId] };
+                    const media = { mimeType: mimeType, body: fileStream };
+                    const response = await drive.files.create({ resource: fileMetadata, media: media, fields: 'id, webViewLink' });
+                    const { id: fileId, webViewLink: fileUrl } = response.data;
+
+                    await drive.permissions.create({ fileId, requestBody: { role: 'reader', type: 'anyone' } });
+                    
+                    // Se actualiza la nueva columna de URL y se limpia el blob del adjunto
+                    await poolConnect.request()
+                        .input('TickSec', sql.Int, TickSec)
+                        .input('TickAdjUrlGooDriv', sql.VarChar, fileUrl)
+                        .query("UPDATE Ticket SET TickAdjFac = NULL, TickAdjUrlGooDriv = @TickAdjUrlGooDriv WHERE TickSec = @TickSec");
+                    
+                    results.adjuntos.push({ ticketSec: TickSec, url: fileUrl });
+                    console.log(`[Proceso 2]: Adjunto ${TickSec} subido y actualizado.`);
+                }
+
+                console.log('\n[UploadFile]: Proceso completado exitosamente.');
+                res.status(200).json({ message: 'Procesos de subida finalizados.', results });
+
             } finally {
                 poolConnect.close();
                 console.log('[Database]: Conexión cerrada.');
             }
         } catch (error) {
-            console.error('[Error]:', error);
-            res.status(500).json({ error: 'Error al procesar los tickets.' });
+            console.error('[Error General]:', error.response ? error.response.data : error.message);
+            res.status(500).json({ error: 'Error al procesar la solicitud.' });
         }
     }
 }
