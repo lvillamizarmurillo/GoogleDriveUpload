@@ -3,7 +3,7 @@ import Upload from '../Services/upload.js';
 
 const router = Router();
 
-// Ya no se necesita 'multer'. La petición es de tipo JSON.
-router.post('/upload-comprobante', Upload.uploadFile);
+// Ruta actualizada para aceptar parámetros que controlan el flujo de ejecución
+router.post('/upload/:esComprobante/:esAdjunto/:esCotizacion', Upload.uploadFile);
 
 export default router;
